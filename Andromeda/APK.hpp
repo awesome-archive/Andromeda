@@ -5,7 +5,9 @@
 #include "dex.hpp"
 #include "manifest.hpp"
 #include "cert.hpp"
+#include "patterns.hpp"
 
+#include "digestpp/digestpp.hpp"
 
 namespace andromeda
 {
@@ -17,6 +19,7 @@ namespace andromeda
 		std::shared_ptr<andromeda::certificate> cert;
 		std::vector<parsed_dex> parsed_dexes{};
 		std::string unzip_path{};
+		std::vector<std::string> file_pathes{};
 
 		explicit apk(const std::string& full_path)
 		{
@@ -25,7 +28,10 @@ namespace andromeda
 
 			if (utils::ends_with(full_path, ".apk"))
 			{
-				unzip_path = utils::unzip_file(full_path, false);
+				const auto unzip_result = utils::unzip_file(full_path, false);
+				this->unzip_path = std::get<0>(unzip_result);
+				this->file_pathes = std::get<1>(unzip_result);
+
 				if (unzip_path.empty())
 				{
 					color_printf(color::FG_RED, "Failed to unpack the file: %s\n",
@@ -83,8 +89,13 @@ namespace andromeda
 		apk(const apk&) = default;
 		apk& operator=(const apk&) = default;
 
-		std::vector<std::string> get_libs(const fs::path& file_path, const bool extract = false, const std::string& target_lib_path = "")
+		std::vector<std::string> get_libs(const fs::path& file_path, bool extract = false, const std::string& target_lib_path = "", const bool get_hash = false)
 		{
+			if (get_hash == true)
+			{
+				extract = true;
+			}
+
 			std::vector<std::string> libs{};
 
 			mz_zip_archive zip_archive;
@@ -104,6 +115,7 @@ namespace andromeda
 
 			const auto dest_dir = fs::current_path().string() + '/' + "libs";
 
+			const auto current_path = fs::current_path().string();
 			for (auto i = 0; i < file_count; i++)
 			{
 				mz_zip_archive_file_stat file_stat;
@@ -153,7 +165,17 @@ namespace andromeda
 					}
 					else
 					{
-						color::color_printf(color::FG_GREEN, "unpacked lib: %s\n", dest_file.c_str());
+						if (get_hash == true)
+						{
+							const auto file_content = utils::read_file_content(dest_file);
+							const auto file_sha1_ascii = digestpp::sha1().absorb(file_content).hexdigest();
+							color::color_printf(color::FG_GREEN, "%s: ", file_name.c_str());
+							color::color_printf(color::FG_DARK_GRAY, "%s\n", file_sha1_ascii.c_str());
+						}
+						else
+						{
+							color::color_printf(color::FG_GREEN, "unpacked lib: %s\n", dest_file.c_str());
+						}
 					}
 				}
 
@@ -179,6 +201,62 @@ namespace andromeda
 				}
 			}
 
+		}
+
+		void find_dump_class(const std::string& class_part)
+		{
+			for (auto& dex : parsed_dexes)
+			{
+				const auto dex_classes = dex.get_classes();
+				if (!dex_classes.empty())
+				{
+					for (const auto& i_class : dex_classes)
+					{
+						if (utils::find_case_insensitive(i_class, class_part) != std::string::npos)
+						{
+							color::color_printf(color::FG_DARK_GRAY, "DEX file: %s\n", dex.get_dex_name().c_str());
+							color::color_printf(color::FG_GREEN, "\t%s\n", i_class.c_str());
+						}
+					}
+				}
+			}
+		}
+
+		void dump_methods()
+		{
+			for (auto& parsed_dex : parsed_dexes)
+			{
+				const auto dex_methods = parsed_dex.get_methods();
+				if (!dex_methods.empty())
+				{
+					color::color_printf(color::FG_DARK_GRAY, "DEX file: %s\n", parsed_dex.get_dex_name().c_str());
+					for (const auto& [class_path, method_name] : dex_methods)
+					{
+						color::color_printf(color::FG_DARK_GRAY, "%s.", class_path.c_str());
+						color::color_printf(color::FG_GREEN, "%s\n", method_name.c_str());
+					}
+				}
+			}
+		}
+
+		void fin_dump_method(const std::string& target_method_name)
+		{
+			for (auto& parsed_dex : parsed_dexes)
+			{
+				const auto dex_methods = parsed_dex.get_methods();
+				if (!dex_methods.empty())
+				{
+					for (const auto& [class_path, method_name] : dex_methods)
+					{
+						if (utils::find_case_insensitive(method_name, target_method_name) != std::string::npos)
+						{
+							color::color_printf(color::FG_DARK_GRAY, "DEX file: %s\n", parsed_dex.get_dex_name().c_str());
+							color::color_printf(color::FG_DARK_GRAY, "%s.", class_path.c_str());
+							color::color_printf(color::FG_GREEN, "%s\n", method_name.c_str());
+						}
+					}
+				}
+			}
 		}
 
 		void dump_class_methods(const std::string& class_path)
@@ -222,6 +300,64 @@ namespace andromeda
 			{
 				color::color_printf(color::FG_LIGHT_RED, "Failed to locale method: %s\n",
 				                    method_path.c_str());
+			}
+		}
+
+		void dump_permissions() const 
+		{
+			if (!app_manifest->permissions.empty())
+			{
+				color::color_printf(color::FG_DARK_GRAY, "Permissions:\n");
+				for (const auto& perm : app_manifest->permissions)
+				{
+					color::color_printf(color::FG_GREEN, "\t%s\n", perm.c_str());
+				}
+			}
+		}
+
+		
+		void dump_activities() const 
+		{
+			if (!app_manifest->activities.empty())
+			{
+				color::color_printf(color::FG_DARK_GRAY, "Activities:\n");
+				for (const auto& [name, intents]  : app_manifest->activities)
+				{
+					auto full_class_name = name;
+					if (!full_class_name.empty() && full_class_name[0] == '.')
+					{
+						if (!app_manifest->manifest_package.empty())
+						{
+							full_class_name = app_manifest->manifest_package + full_class_name;
+						}
+					}
+
+					color_printf(color::FG_GREEN, "\t%s\n", full_class_name.c_str());
+				}
+			}
+		}
+
+		void dump_services() const
+		{
+			if (!app_manifest->services.empty())
+			{
+				color::color_printf(color::FG_DARK_GRAY, "Services:\n");
+				for (const auto& [name, intents]  : app_manifest->services)
+				{
+					color_printf(color::FG_GREEN, "\t%s\n", name.c_str());
+				}
+			}
+		}
+
+		void dump_receivers() const
+		{
+			if (!app_manifest->receivers.empty())
+			{
+				color::color_printf(color::FG_DARK_GRAY, "Receivers:\n");
+				for (const auto& [name, intents]  : app_manifest->receivers)
+				{
+					color_printf(color::FG_GREEN, "\t%s\n", name.c_str());
+				}
 			}
 		}
 
@@ -280,6 +416,53 @@ namespace andromeda
 			}
 		}
 
+		void dump_interesting_strings()
+		{
+			std::vector<std::string> urls{};
+			std::vector<std::string> emails{};
+
+			for (auto parsed_dex : parsed_dexes)
+			{
+				const auto dex_strings = parsed_dex.get_strings();
+				if (!dex_strings.empty())
+				{
+					for (const auto& str : dex_strings)
+					{
+						if (is_url(str))
+						{
+							urls.emplace_back(str);
+						}
+						
+						if(is_email(str))
+						{
+							emails.emplace_back(str);
+						}
+					}
+				}
+			}
+
+			// URLs:
+			if (!urls.empty())
+			{
+				color::color_printf(color::FG_DARK_GRAY, "URLs:\n");
+				for (const auto& url : urls)
+				{
+					color::color_printf(color::FG_GREEN, "\t%s\n", url.c_str());
+				}
+			}
+
+			// emails
+			if (!emails.empty())
+			{
+				color::color_printf(color::FG_DARK_GRAY, "e-Mails:\n");
+				for (const auto& email : emails)
+				{
+					color::color_printf(color::FG_GREEN, "\t%s\n", email.c_str());
+				}
+			}
+
+		}
+
 		void search_string(std::string& target_string)
 		{
 			for (auto parsed_dex : parsed_dexes)
@@ -300,6 +483,29 @@ namespace andromeda
 			}
 		}
 
+		void dump_language()
+		{
+			std::string lang = "Java";
+			auto print_color = color::FG_LIGHT_RED;
+
+			for (const auto& file_path : this->file_pathes)
+			{
+				if (file_path.find("kotlin/") == 0) // starts_with
+				{
+					lang = "Kotlin";
+					print_color = color::FG_CYAN;
+					break;
+				}
+				else if (file_path.find("assemblies/Xamarin.") == 0)
+				{
+					lang = ".NET (Xamarin)";
+					print_color = color::FG_BLUE;
+					break;
+				}
+			}
+
+			color::color_printf(print_color, "%s\n", lang.c_str());
+		}
 
 		// class apk
 	};
